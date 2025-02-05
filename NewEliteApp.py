@@ -1,6 +1,5 @@
 import os
 import json
-import uuid
 import random
 import shutil
 import tkinter as tk
@@ -32,21 +31,23 @@ class StorageMetadata:
     backup_path: str = ""
 
 class BaseJsonStorage:
-    """Base class for JSON storage operations with built-in validation and backup"""
+    """Base class for JSON storage operations with simplified metadata handling"""
     
     def __init__(self, filepath: str, backup_dir: str = "backups"):
         self.filepath = filepath
         self.backup_dir = os.path.join(os.path.dirname(filepath), backup_dir)
-        self.metadata = StorageMetadata()
         self.ensure_directories()
+        self._metadata = {
+            "version": "1.0.0",
+            "last_modified": "",
+            "backup_path": ""
+        }
 
     def ensure_directories(self):
-        """Ensure required directories exist"""
         os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
         os.makedirs(self.backup_dir, exist_ok=True)
 
     def create_backup(self) -> str:
-        """Create a backup of the current data file"""
         if not os.path.exists(self.filepath):
             return ""
             
@@ -58,18 +59,13 @@ class BaseJsonStorage:
         
         try:
             shutil.copy2(self.filepath, backup_path)
-            self.metadata.backup_path = backup_path
+            self._metadata["backup_path"] = backup_path
             return backup_path
         except Exception as e:
             raise StorageOperationError(f"Failed to create backup: {str(e)}")
 
-    def validate_data(self, data: dict) -> bool:
-        """Validate data structure before saving
-        Override this method in subclasses to implement specific validation"""
-        return True
-
     def read(self) -> dict:
-        """Read and validate JSON data from file"""
+        """Read data from file, handling metadata internally"""
         try:
             if not os.path.exists(self.filepath):
                 return {}
@@ -77,31 +73,30 @@ class BaseJsonStorage:
             with open(self.filepath, 'r') as f:
                 data = json.load(f)
                 
-            if not self.validate_data(data):
-                raise ValidationError(f"Invalid data structure in {self.filepath}")
+            # Extract and store metadata if present
+            if "_metadata" in data:
+                self._metadata.update(data.pop("_metadata"))
                 
             return data
+            
         except json.JSONDecodeError as e:
             raise StorageOperationError(f"Invalid JSON in {self.filepath}: {str(e)}")
         except Exception as e:
             raise StorageOperationError(f"Failed to read {self.filepath}: {str(e)}")
 
     def write(self, data: dict):
-        """Write JSON data to file with validation and backup"""
-        if not self.validate_data(data):
-            raise ValidationError(f"Invalid data structure for {self.filepath}")
-            
+        """Write data to file, automatically handling metadata"""
         try:
-            # Create backup before writing
+            # Update metadata
+            self._metadata["last_modified"] = datetime.now().isoformat()
+            
+            # Create backup
             self.create_backup()
             
-            # Update metadata
-            self.metadata.last_modified = datetime.now().isoformat()
-            
-            # Combine data with metadata
+            # Add metadata to data structure
             full_data = {
-                "metadata": asdict(self.metadata),
-                "data": data
+                "_metadata": self._metadata,
+                **data
             }
             
             # Write to temporary file first
@@ -109,25 +104,12 @@ class BaseJsonStorage:
             with open(temp_path, 'w') as f:
                 json.dump(full_data, f, indent=2)
             
-            # Replace original file with temporary file
+            # Replace original file
             os.replace(temp_path, self.filepath)
             
         except Exception as e:
             raise StorageOperationError(f"Failed to write to {self.filepath}: {str(e)}")
 
-    def restore_from_backup(self, backup_path: str = None):
-        """Restore data from a backup file"""
-        if not backup_path:
-            backup_path = self.metadata.backup_path
-            
-        if not backup_path or not os.path.exists(backup_path):
-            raise StorageOperationError("No valid backup file found")
-            
-        try:
-            shutil.copy2(backup_path, self.filepath)
-            return self.read()
-        except Exception as e:
-            raise StorageOperationError(f"Failed to restore from backup: {str(e)}")
 
 class StorageManager:
     """Central manager for all storage operations"""
@@ -154,18 +136,18 @@ class StorageManager:
     def save_all(self):
         """Save all storage components"""
         try:
-            self.exercise_storage.save()
-            self.workout_storage.save()
-            self.program_storage.save()
+            self.exercise_storage.save_data()
+            self.workout_storage.save_data()
+            self.program_storage.save_data()
         except Exception as e:
             raise StorageOperationError(f"Failed to save all data: {str(e)}")
 
     def load_all(self):
         """Load all storage components"""
         try:
-            self.exercise_storage.load()
-            self.workout_storage.load()
-            self.program_storage.load()
+            self.exercise_storage.load_data()
+            self.workout_storage.load_data()
+            self.program_storage.load_data()
         except Exception as e:
             raise StorageOperationError(f"Failed to load all data: {str(e)}")
 
@@ -542,7 +524,11 @@ class Workout:
                  workout_id: str = None, plane: str = None):
         self.type = workout_type
         self.exercises = exercises
-        self.id = workout_id or str(uuid.uuid4())
+        if not workout_id:
+            date_prefix = datetime.now().strftime("%Y%m%d")
+            self.id = f"{date_prefix}_01"  # Default to first sequence of the day
+        else:
+            self.id = workout_id
         self.plane = plane
         
     def to_dict(self) -> dict:
@@ -572,225 +558,110 @@ class Workout:
         )
 
 class WorkoutStorage(BaseJsonStorage):
-    """Handles workout data storage with validation and backup capabilities"""
-    
     def __init__(self, filepath: str):
         super().__init__(filepath)
-        self.metadata = WorkoutMetadata()
+        # Ensure proper nested structure initialization
         self.workouts = {
             "squat_push": {"horizontal": [], "vertical": []},
             "hinge_pull": {"horizontal": [], "vertical": []},
             "total_body": []
         }
+        self._metadata.update({
+            "total_workouts": 0,
+            "workout_types": {
+                "squat_push": 0,
+                "hinge_pull": 0,
+                "total_body": 0
+            }
+        })
         self.load_data()
         
-    def validate_data(self, data: dict) -> bool:
-        """Validate workout data structure and content"""
-        try:
-            if not isinstance(data, dict):
-                return False
-                
-            # Validate metadata if present
-            if "metadata" in data:
-                metadata = data["metadata"]
-                if not all(key in metadata for key in ["version", "last_modified", "total_workouts", "workout_types"]):
-                    return False
-                data = data.get("data", {})
-                
-            # Check required categories
-            required_categories = {"squat_push", "hinge_pull", "total_body"}
-            if not all(category in data for category in required_categories):
-                return False
-                
-            # Validate split workout structure
-            for category in ["squat_push", "hinge_pull"]:
-                if not isinstance(data[category], dict):
-                    return False
-                    
-                # Check plane categories
-                if not all(plane in data[category] for plane in ["horizontal", "vertical"]):
-                    return False
-                    
-                # Validate workout lists
-                for plane_workouts in data[category].values():
-                    if not isinstance(plane_workouts, list):
-                        return False
-                    
-                    # Validate individual workouts
-                    for workout in plane_workouts:
-                        if not self._validate_workout_structure(workout):
-                            return False
-            
-            # Validate total body workouts
-            if not isinstance(data["total_body"], list):
-                return False
-                
-            for workout in data["total_body"]:
-                if not self._validate_workout_structure(workout):
-                    return False
-                    
-            return True
-            
-        except Exception:
-            return False
-            
-    def _validate_workout_structure(self, workout: dict) -> bool:
-        """Validate individual workout data structure"""
-        try:
-            required_fields = {"id", "type", "exercises"}
-            if not all(field in workout for field in required_fields):
-                return False
-                
-            if not isinstance(workout["exercises"], dict):
-                return False
-            
-            # Validate exercise positions
-            if workout["type"] == "total_body":
-                required_positions = {f"{i}{c}" for i in range(1, 4) for c in 'abc'}
-            else:
-                required_positions = (
-                    {f"{i}a" for i in range(1, 4)} |
-                    {f"{i}b" for i in range(1, 4)} |
-                    {f"4{c}" for c in 'ab'}
-                )
-                
-            if set(workout["exercises"].keys()) != required_positions:
-                return False
-                
-            # Validate exercise structure
-            for exercise in workout["exercises"].values():
-                required_exercise_fields = {"name", "id", "pattern"}
-                if not all(field in exercise for field in required_exercise_fields):
-                    return False
-                    
-                # Validate exercise properties
-                if not isinstance(exercise["name"], str) or not exercise["name"]:
-                    return False
-                if not isinstance(exercise["id"], str) or not exercise["id"]:
-                    return False
-                if not isinstance(exercise["pattern"], str) or not exercise["pattern"]:
-                    return False
-                    
-            return True
-            
-        except Exception:
-            return False
-        
-    def _update_metadata(self):
-        """Update storage metadata"""
-        self.metadata.last_modified = datetime.now().isoformat()
-        self.metadata.total_workouts = sum(
-            len(workouts) if isinstance(workouts, list) else
-            sum(len(plane_workouts) for plane_workouts in workouts.values())
-            for workouts in self.workouts.values()
-        )
-        
-        # Update workout type counts
-        self.metadata.workout_types = {
-            "squat_push": sum(len(workouts) for workouts in self.workouts["squat_push"].values()),
-            "hinge_pull": sum(len(workouts) for workouts in self.workouts["hinge_pull"].values()),
-            "total_body": len(self.workouts["total_body"])
-        }
-        
     def load_data(self):
-        """Load workout data from storage with validation"""
-        try:
-            data = self.read()
-            
-            # Load metadata if present
-            if "metadata" in data:
-                metadata = data["metadata"]
-                self.metadata = WorkoutMetadata(
-                    version=metadata.get("version", "1.0.0"),
-                    last_modified=metadata.get("last_modified", ""),
-                    total_workouts=metadata.get("total_workouts", 0),
-                    workout_types=metadata.get("workout_types", {
-                        "squat_push": 0,
-                        "hinge_pull": 0,
-                        "total_body": 0
-                    })
-                )
-                data = data.get("data", {})
-            
-            # Clear existing data
-            for category in self.workouts:
-                if category == "total_body":
-                    self.workouts[category] = []
-                else:
-                    self.workouts[category] = {"horizontal": [], "vertical": []}
-            
-            # Load new data
-            for category, type_data in data.items():
-                if category == "total_body":
-                    self.workouts[category] = [
-                        Workout.from_dict(w) for w in type_data
-                    ]
-                else:
-                    for plane in ["horizontal", "vertical"]:
-                        self.workouts[category][plane] = [
-                            Workout.from_dict(w) for w in type_data.get(plane, [])
-                        ]
-                        
-            # Update metadata
-            self._update_metadata()
-                        
-        except Exception as e:
-            raise StorageOperationError(f"Failed to load workout data: {str(e)}")
-            
+        """Load workout data and update metadata"""
+        data = self.read()
+        
+        # Clear and reload workout data
+        for category in self.workouts:
+            if category == "total_body":
+                self.workouts[category] = [
+                    Workout.from_dict(w) for w in data.get(category, [])
+                ]
+            else:
+                self.workouts[category] = {
+                    plane: [Workout.from_dict(w) for w in workouts]
+                    for plane, workouts in data.get(category, {}).items()
+                }
+                
+        self._update_metadata()
+        
     def save_data(self):
-        """Save workout data with validation and backup"""
-        try:
-            # Update metadata
-            self._update_metadata()
-            
-            # Prepare workout data
-            workout_data = {}
-            for category, type_data in self.workouts.items():
-                if category == "total_body":
-                    workout_data[category] = [w.to_dict() for w in type_data]
-                else:
-                    workout_data[category] = {
-                        plane: [w.to_dict() for w in workouts]
-                        for plane, workouts in type_data.items()
-                    }
-            
-            # Combine with metadata using asdict
-            data = {
-                "metadata": asdict(self.metadata),
-                "data": workout_data
-            }
-                    
-            self.write(data)
-            
-        except Exception as e:
-            raise StorageOperationError(f"Failed to save workout data: {str(e)}")
-            
+        """Save workout data with updated metadata"""
+        self._update_metadata()
+        
+        data = {}
+        for category, type_data in self.workouts.items():
+            if category == "total_body":
+                data[category] = [w.to_dict() for w in type_data]
+            else:
+                data[category] = {
+                    plane: [w.to_dict() for w in workouts]
+                    for plane, workouts in type_data.items()
+                }
+                
+        self.write(data)
+
     def add_workout(self, workout: Workout) -> tuple[bool, str]:
-        """Add a new workout to storage"""
+        """Add a new workout to storage with proper validation"""
         try:
             # Validate workout type
             if workout.type not in self.workouts:
                 return False, f"Invalid workout type: {workout.type}"
-                
+            
             # Set ID if not present
             if not workout.id:
-                workout.id = str(uuid.uuid4())
+                date_prefix = datetime.now().strftime("%Y%m%d")
+                # Find latest sequence number for today
+                existing_ids = []
+                for type_data in self.workouts.values():
+                    if isinstance(type_data, list):
+                        existing_ids.extend(w.id for w in type_data if w.id.startswith(date_prefix))
+                    else:
+                        for plane_workouts in type_data.values():
+                            existing_ids.extend(w.id for w in plane_workouts if w.id.startswith(date_prefix))
                 
+                if existing_ids:
+                    sequences = [int(id.split('_')[1]) for id in existing_ids]
+                    next_sequence = max(sequences) + 1
+                else:
+                    next_sequence = 1
+                    
+                workout.id = f"{date_prefix}_{next_sequence:02d}"
+            
+            # Handle total body workouts
             if workout.type == "total_body":
                 self.workouts[workout.type].append(workout)
             else:
+                # Validate plane focus for split workouts
                 if not workout.plane:
                     return False, "Plane focus required for split workouts"
                 if workout.plane not in ["horizontal", "vertical"]:
                     return False, f"Invalid plane: {workout.plane}"
-                self.workouts[workout.type][workout.plane].append(workout)
+                    
+                # Ensure the nested structure exists
+                if workout.type not in self.workouts:
+                    self.workouts[workout.type] = {"horizontal": [], "vertical": []}
+                if workout.plane not in self.workouts[workout.type]:
+                    self.workouts[workout.type][workout.plane] = []
                 
+                # Add the workout
+                self.workouts[workout.type][workout.plane].append(workout)
+            
             self.save_data()
             return True, f"Workout saved with ID: {workout.id}"
             
         except Exception as e:
             return False, f"Error saving workout: {str(e)}"
-            
+
     def remove_workout(self, workout_id: str) -> tuple[bool, str]:
         """Remove a workout from storage"""
         try:
@@ -813,7 +684,7 @@ class WorkoutStorage(BaseJsonStorage):
             
         except Exception as e:
             return False, f"Error removing workout: {str(e)}"
-            
+
     def clear_workouts(self, workout_type: str = None, plane: str = None) -> tuple[bool, str]:
         """Clear workouts with optional type and plane filtering"""
         try:
@@ -880,15 +751,20 @@ class WorkoutStorage(BaseJsonStorage):
                 
         except Exception as e:
             raise StorageOperationError(f"Error retrieving workouts: {str(e)}")
-            
-    def restore_from_backup(self, backup_path: str = None):
-        """Restore workout data from backup"""
-        try:
-            data = super().restore_from_backup(backup_path)
-            self.load_data()  # Reload data from restored file
-            return data
-        except Exception as e:
-            raise StorageOperationError(f"Failed to restore from backup: {str(e)}")
+        
+    def _update_metadata(self):
+        """Update workout-specific metadata"""
+        self._metadata["total_workouts"] = sum(
+            len(workouts) if isinstance(workouts, list) else
+            sum(len(plane_workouts) for plane_workouts in workouts.values())
+            for workouts in self.workouts.values()
+        )
+        
+        self._metadata["workout_types"] = {
+            "squat_push": sum(len(workouts) for workouts in self.workouts["squat_push"].values()),
+            "hinge_pull": sum(len(workouts) for workouts in self.workouts["hinge_pull"].values()),
+            "total_body": len(self.workouts["total_body"])
+        }
 
 class WorkoutGenerator:
     """Handles workout generation logic"""
@@ -993,12 +869,17 @@ class WorkoutGenerator:
 
 "START OF PROGRAM MANAGEMENT MODULE"
 class Program:
-    """Represents a complete training program cycle"""
+    """Represents a complete training program cycle with date-based ID"""
     def __init__(self, weeks: List[Dict], program_id: str = None):
         self.weeks = weeks
-        self.id = program_id or str(uuid.uuid4())
         self.date_created = datetime.now().isoformat()
-        
+        # If no ID provided, generate one based on current date
+        if not program_id:
+            date_prefix = datetime.now().strftime("%Y%m%d")
+            self.id = f"{date_prefix}_01"  # Default to first sequence of the day
+        else:
+            self.id = program_id
+
     def to_dict(self) -> dict:
         """Convert program to dictionary representation"""
         return {
@@ -1033,12 +914,12 @@ class Program:
         return program
 
 class ProgramStorage(BaseJsonStorage):
-    """Handles program cycle data storage"""
+    """Handles program cycle data storage with date-based IDs"""
     def __init__(self, filepath: str):
         super().__init__(filepath)
         self.programs = []
         self.load_data()
-        
+
     def load_data(self):
         """Load program data from storage"""
         data = self.read()
@@ -1048,10 +929,38 @@ class ProgramStorage(BaseJsonStorage):
         """Save program data to storage"""
         data = {"programs": [p.to_dict() for p in self.programs]}
         self.write(data)
-        
+
+    def get_next_sequence_number(self, date_prefix: str) -> str:
+        """Get the next available sequence number for a given date prefix"""
+        matching_programs = [p for p in self.programs if p.id.startswith(date_prefix)]
+        if not matching_programs:
+            return f"{date_prefix}_01"
+            
+        # Extract sequence numbers and find the highest
+        sequences = [int(p.id.split('_')[1]) for p in matching_programs]
+        next_sequence = max(sequences) + 1
+        return f"{date_prefix}_{next_sequence:02d}"
+
     def add_program(self, program: Program) -> tuple[bool, str]:
-        """Add a new program to storage"""
+        """Add a new program with date-based ID"""
         try:
+            # Generate new ID if none provided
+            if not program.id:
+                date_prefix = datetime.now().strftime("%Y%m%d")
+                program.id = self.get_next_sequence_number(date_prefix)
+            
+            # Verify ID format
+            try:
+                date_part, seq_part = program.id.split('_')
+                datetime.strptime(date_part, "%Y%m%d")
+                int(seq_part)
+            except (ValueError, IndexError):
+                return False, "Invalid program ID format"
+            
+            # Always generate a new unique ID regardless of the input
+            date_prefix = datetime.now().strftime("%Y%m%d")
+            program.id = self.get_next_sequence_number(date_prefix)
+            
             self.programs.append(program)
             self.save_data()
             return True, f"Program saved with ID: {program.id}"
@@ -1075,6 +984,16 @@ class ProgramStorage(BaseJsonStorage):
             return True, "All programs cleared"
         except Exception as e:
             return False, f"Error clearing programs: {str(e)}"
+
+    def get_programs(self, sort_by_date: bool = True) -> List[Program]:
+        """Get all programs, optionally sorted by date"""
+        if sort_by_date:
+            return sorted(
+                self.programs,
+                key=lambda p: (p.id.split('_')[0], int(p.id.split('_')[1])),
+                reverse=True
+            )
+        return self.programs.copy()
 
 class WorkoutProgramGenerator:
     """Handles program cycle generation"""
@@ -1150,59 +1069,105 @@ class WorkoutProgramGenerator:
 class StatusDisplay:
     """Displays storage and program statistics with automatic updates"""
     def __init__(self, parent: ttk.Frame, storage_manager: StorageManager):
-        self.frame = ttk.LabelFrame(parent, text="System Status", padding="5")
+        # Create a larger frame with more padding
+        self.frame = ttk.LabelFrame(parent, text="System Status", padding="10")
         self.storage = storage_manager
         
-        # Create text display
-        self.text = tk.Text(self.frame, height=6, width=40)
-        self.text.pack(expand=True, fill='both', padx=5, pady=5)
+        # Create text display with increased dimensions
+        self.text = tk.Text(self.frame, height=15, width=80)  # Increased height and width
+        
+        # Configure tag for header formatting
+        self.text.tag_configure("header", font=("TkDefaultFont", 10, "bold"))
+        
+        # Add scrollbars for both vertical and horizontal scrolling
+        y_scrollbar = ttk.Scrollbar(self.frame, orient=tk.VERTICAL, command=self.text.yview)
+        x_scrollbar = ttk.Scrollbar(self.frame, orient=tk.HORIZONTAL, command=self.text.xview)
+        
+        # Configure text widget scrolling
+        self.text.configure(yscrollcommand=y_scrollbar.set, xscrollcommand=x_scrollbar.set, wrap=tk.NONE)
+        
+        # Grid layout for better control
+        self.text.grid(row=0, column=0, sticky='nsew')
+        y_scrollbar.grid(row=0, column=1, sticky='ns')
+        x_scrollbar.grid(row=1, column=0, sticky='ew')
+        
+        # Configure grid weights
+        self.frame.grid_rowconfigure(0, weight=1)
+        self.frame.grid_columnconfigure(0, weight=1)
         
         # Initial update
         self.update_display()
         
     def update_display(self):
-        """Update status information"""
+        """Update status information with improved formatting"""
         try:
             # Enable text widget for updating
             self.text.config(state='normal')
             self.text.delete(1.0, tk.END)
             
-            # Exercise counts
-            total_exercises = sum(
-                len(info["exercises"]) 
-                for info in self.storage.exercise_storage.categories.values()
-            )
+            # Exercise counts with category breakdown
+            self.text.insert(tk.END, "Exercise Library Status\n", "header")
+            total_exercises = 0
+            for category, info in self.storage.exercise_storage.categories.items():
+                count = len(info["exercises"])
+                total_exercises += count
+                display_name = category.replace('_', ' ').title()
+                self.text.insert(tk.END, f"{display_name}: {count} exercises\n")
+            self.text.insert(tk.END, f"Total Exercises: {total_exercises}\n\n")
             
-            # Workout counts
-            total_workouts = sum(
-                len(workouts) if isinstance(workouts, list) else
-                sum(len(plane_workouts) for plane_workouts in workouts.values())
-                for workouts in self.storage.workout_storage.workouts.values()
-            )
+            # Workout counts with detailed breakdown
+            self.text.insert(tk.END, "Workout Status\n", "header")
+            workout_counts = {
+                "squat_push": {"horizontal": 0, "vertical": 0},
+                "hinge_pull": {"horizontal": 0, "vertical": 0},
+                "total_body": 0
+            }
             
-            # Program count
-            total_programs = len(self.storage.program_storage.programs)
-            
-            # Format display text
-            status = (
-                f"Total Exercises: {total_exercises}\n"
-                f"Total Workouts: {total_workouts}\n"
-                f"Total Programs: {total_programs}\n\n"
-            )
-            
-            # Add workout breakdown
-            status += "Workout Distribution:\n"
-            for workout_type, workouts in self.storage.workout_storage.workouts.items():
-                if workout_type == "total_body":
-                    count = len(workouts)
-                    status += f"- Total Body: {count}\n"
+            # Calculate counts
+            for type_name, workouts in self.storage.workout_storage.workouts.items():
+                if type_name == "total_body":
+                    workout_counts[type_name] = len(workouts)
                 else:
-                    type_display = workout_type.replace("_", "/")
                     for plane, plane_workouts in workouts.items():
-                        count = len(plane_workouts)
-                        status += f"- {type_display} ({plane}): {count}\n"
+                        workout_counts[type_name][plane] = len(plane_workouts)
             
-            self.text.insert(tk.END, status)
+            # Display split workout counts
+            for type_name in ["squat_push", "hinge_pull"]:
+                display_name = type_name.replace('_', '/').title()
+                self.text.insert(tk.END, f"{display_name}:\n")
+                for plane, count in workout_counts[type_name].items():
+                    self.text.insert(tk.END, f"  {plane.title()}: {count}\n")
+            
+            # Display total body count
+            self.text.insert(tk.END, f"Total Body: {workout_counts['total_body']}\n")
+            
+            # Calculate and display total workouts
+            total_workouts = (
+                workout_counts['total_body'] +
+                sum(workout_counts['squat_push'].values()) +
+                sum(workout_counts['hinge_pull'].values())
+            )
+            self.text.insert(tk.END, f"Total Workouts: {total_workouts}\n\n")
+            
+            # Program status
+            self.text.insert(tk.END, "Program Status\n", "header")
+            total_programs = len(self.storage.program_storage.programs)
+            self.text.insert(tk.END, f"Total Programs: {total_programs}\n")
+            
+            if total_programs > 0:
+                recent_programs = sorted(
+                    self.storage.program_storage.programs,
+                    key=lambda p: p.id,
+                    reverse=True
+                )[:5]
+                self.text.insert(tk.END, "Recent Programs:\n")
+                for program in recent_programs:
+                    date_str = datetime.strptime(
+                        program.id.split('_')[0], 
+                        "%Y%m%d"
+                    ).strftime("%Y-%m-%d")
+                    self.text.insert(tk.END, f"  {program.id} (created: {date_str})\n")
+            
             self.text.config(state='disabled')
         except Exception as e:
             print(f"Error updating status display: {str(e)}")
@@ -1427,6 +1392,9 @@ class ElitePersonalTrainingApp:
         self.workout_generator = WorkoutGenerator(self.storage_manager)
         self.program_generator = WorkoutProgramGenerator(self.storage_manager)
         
+        # Load all data from storage
+        self.storage_manager.load_all()
+        
         # Configure style
         style = ttk.Style()
         style.theme_use('clam')
@@ -1440,9 +1408,32 @@ class ElitePersonalTrainingApp:
         self.setup_unified_workout_tab()
         self.setup_program_cycle_tab()
         
+        # Initialize displays with stored data
+        self.load_initial_data()
+        
         # Show help window on startup
         self.show_help_window()
 
+    def load_initial_data(self):
+        """Load and display all stored data on startup"""
+        try:
+            # Update exercise list if category is selected
+            if self.category_var.get():
+                self.update_exercise_list()
+            
+            # Update workout list
+            self.update_workout_list()
+            
+            # Update program list
+            self.update_program_list()
+            
+            # Update status display
+            if hasattr(self, 'status_display'):
+                self.status_display.update_display()
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load initial data: {str(e)}")
+    
     def setup_library_tab(self):
         """Setup the exercise library management tab"""
         library_frame = ttk.Frame(self.notebook, padding="10")
@@ -1485,18 +1476,12 @@ class ElitePersonalTrainingApp:
         ttk.Button(add_frame, text="Add Exercise", 
                   command=self.add_exercise).pack(side='right')
         
-        # Control Buttons
+        # Control Buttons - Only keeping Remove Selected Exercise
         button_frame = ttk.Frame(library_frame)
         button_frame.pack(fill='x', pady=5)
         
         ttk.Button(button_frame, text="Remove Selected Exercise",
                   command=self.remove_exercise).pack(side='left', expand=True, fill='x', padx=2)
-        
-        ttk.Button(button_frame, text="Save Library",
-                  command=self.save_library).pack(side='left', expand=True, fill='x', padx=2)
-        
-        ttk.Button(button_frame, text="Load Library",
-                  command=self.load_library).pack(side='left', expand=True, fill='x', padx=2)
 
     def setup_unified_workout_tab(self):
         """Setup the unified workout generation and management tab"""
@@ -1694,8 +1679,10 @@ class ElitePersonalTrainingApp:
         category = self.category_var.get()
         
         if category in self.storage_manager.exercise_storage.categories:
-            exercises = sorted(self.storage_manager.exercise_storage.categories[category]["exercises"],
-                            key=lambda x: x.name.lower())
+            exercises = sorted(
+                self.storage_manager.exercise_storage.categories[category]["exercises"],
+                key=lambda x: x.name.lower()
+            )
             for exercise in exercises:
                 self.exercise_list.insert(tk.END, f"{exercise.name} ({exercise.id})")
 
@@ -1893,11 +1880,18 @@ class ElitePersonalTrainingApp:
             messagebox.showinfo("Success", "All workouts cleared")
 
     def update_program_list(self):
-        """Update the program list display"""
+        """Update the program list display with date-based IDs"""
         self.program_list.delete(0, tk.END)
-        for program in self.storage_manager.program_storage.programs:
-            created_date = datetime.fromisoformat(program.date_created).strftime("%Y-%m-%d")
-            self.program_list.insert(tk.END, f"Program {program.id} ({created_date})")
+        
+        # Get sorted programs
+        programs = self.storage_manager.program_storage.get_programs(sort_by_date=True)
+        
+        for program in programs:
+            # Parse date from ID for display
+            date_part = program.id.split('_')[0]
+            seq_part = program.id.split('_')[1]
+            display_date = datetime.strptime(date_part, "%Y%m%d").strftime("%Y-%m-%d")
+            self.program_list.insert(tk.END, f"Program {date_part}_{seq_part} ({display_date})")
 
     def generate_program(self):
         """Generate a new program cycle"""
@@ -1917,12 +1911,16 @@ class ElitePersonalTrainingApp:
             messagebox.showerror("Error", f"Failed to generate program: {str(e)}")
 
     def display_program(self, program: Program):
-        """Display a program in the program text area"""
+        """Display a program with formatted date-based ID"""
         self.program_text.delete(1.0, tk.END)
         
+        # Parse date for display
+        date_part = program.id.split('_')[0]
+        display_date = datetime.strptime(date_part, "%Y%m%d").strftime("%Y-%m-%d")
+        
         header = f"Elite Personal Training Program\n"
-        header += f"Generated: {program.date_created}\n"
-        header += f"Program ID: {program.id}\n\n"
+        header += f"Program ID: {program.id}\n"
+        header += f"Created: {display_date}\n\n"
         self.program_text.insert(tk.END, header)
         
         for week_num, week in enumerate(program.weeks, 1):
@@ -1956,12 +1954,13 @@ class ElitePersonalTrainingApp:
                 self.program_text.insert(tk.END, "\n")
 
     def view_selected_program(self):
-        """Display the selected program details"""
+        """Display the selected program with updated ID parsing"""
         selection = self.program_list.curselection()
         if not selection:
             messagebox.showwarning("Warning", "Please select a program to view")
             return
             
+        # Extract program ID from list display
         program_id = self.program_list.get(selection[0]).split()[1]
         program = next((p for p in self.storage_manager.program_storage.programs 
                        if p.id == program_id), None)
@@ -1972,7 +1971,7 @@ class ElitePersonalTrainingApp:
             messagebox.showerror("Error", "Program not found")
 
     def remove_selected_program(self):
-        """Remove the selected program from storage"""
+        """Remove the selected program with updated ID parsing"""
         selection = self.program_list.curselection()
         if not selection:
             messagebox.showwarning("Warning", "Please select a program to remove")
@@ -1988,7 +1987,7 @@ class ElitePersonalTrainingApp:
                 messagebox.showinfo("Success", message)
             else:
                 messagebox.showerror("Error", message)
-
+                
     def clear_all_programs(self):
         """Clear all stored programs"""
         if messagebox.askyesno("Confirm Clear", "Are you sure you want to clear all programs?"):
@@ -2031,13 +2030,13 @@ if __name__ == "__main__":
     # Create the application instance
     app = ElitePersonalTrainingApp(root)
     
-    # Create top frame for status and help
+    # Create top frame for status and help with increased size
     top_frame = tk.Frame(root)
     top_frame.pack(fill='x', padx=10, pady=5)
     
-    # Add status display to top frame and store reference
+    # Add status display to top frame with increased size
     app.status_display = StatusDisplay(top_frame, app.storage_manager)
-    app.status_display.pack(side='left', expand=True, fill='x')
+    app.status_display.pack(side='left', expand=True, fill='both', padx=5, pady=5)  # Added padding and changed fill
     
     # Add help button to top frame
     help_button = tk.Button(
